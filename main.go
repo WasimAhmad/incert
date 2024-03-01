@@ -3,7 +3,8 @@ package main
 import (
 	"archive/tar"
 	"bytes"
-	"encoding/pem"
+
+	// "encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -34,34 +35,22 @@ func init() {
 	flag.StringVar(&caCertFile, "ca-certs-file", "", "The path to the local CA certificates file")
 	flag.StringVar(&caCertsImageURL, "ca-certs-image-url", "", "The URL of an image to extract the CA certificates from")
 	flag.StringVar(&destImageURL, "dest-image-url", "", "The URL of the image to push the modified image to")
-
 	flag.StringVar(&imageCertPath, "image-cert-path", "/etc/ssl/certs/ca-certificates.crt", "The path to the certificate file in the image (optional)")
 	flag.StringVar(&outputCerts, "output-certs-path", "", "Output the (appended) certificates file from the image to a local file (optional)")
 	flag.BoolVar(&replaceCerts, "replace-certs", false, "Replace the certificates in the certificate file instead of appending them")
-}
-
-func usage() {
-	flag.Usage()
-	os.Exit(1)
 }
 
 func main() {
 	flag.Parse()
 
 	if imageURL == "" || destImageURL == "" || (caCertFile == "" && caCertsImageURL == "") {
-		usage()
+		flag.Usage()
+		os.Exit(1)
 	}
 
-	// Get the cert bytes
 	caCertBytes, err := getCertBytes()
 	if err != nil {
 		log.Fatalf("Failed to get certificate bytes: %s", err)
-	}
-
-	// Sanity check to make sure the caCertBytes are actually a list of pem-encoded certificates
-	block, _ := pem.Decode(caCertBytes)
-	if block == nil || block.Type != "CERTIFICATE" {
-		log.Fatalf("Failed to find any certificates in %s", caCertFile)
 	}
 
 	img, err := fetchImage(imageURL)
@@ -85,71 +74,59 @@ func main() {
 		log.Fatalf("Failed to parse destination image URL %s: %s\n", destImageURL, err)
 	}
 
-	// Push the modified image back to the registry
 	err = remote.Write(newRef, newImg, remote.WithAuthFromKeychain(authn.DefaultKeychain))
 	if err != nil {
 		log.Fatalf("Failed to push modified image %s: %s\n", newRef.String(), err)
 	}
 
 	fmt.Fprintf(os.Stderr, "Successfully appended CA certificates to image %s\n", newRef.String())
-	h, err := newImg.Digest()
-	if err != nil {
-		log.Fatalf("Failed to get digest of image %s: %s\n", newRef.String(), err)
+	if h, err := newImg.Digest(); err == nil {
+		fmt.Printf("%s@sha256:%s\n", newRef.String(), h.Hex)
+	} else {
+		log.Printf("Failed to get digest of image %s: %s\n", newRef.String(), err)
 	}
-	fmt.Printf("%s@sha256:%s\n", newRef.String(), h.Hex)
 }
 
-// Fetch the remote image
 func fetchImage(imageURL string) (v1.Image, error) {
 	ref, err := name.ParseReference(imageURL)
 	if err != nil {
 		return nil, err
 	}
-	img, err := remote.Image(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
-	if err != nil {
-		return nil, err
-	}
-	return img, nil
+	return remote.Image(ref, remote.WithAuthFromKeychain(authn.DefaultKeychain))
 }
 
 func getCertBytes() ([]byte, error) {
-	// Read the certs either from a local file or a remote image
 	if caCertFile != "" {
-		// Read the contents of the local CA certificates file
-		caCertBytes, err := os.ReadFile(caCertFile)
-		if err != nil {
-			log.Fatalf("Failed to read CA certificates file %s: %s\n", caCertFile, err)
-		}
-
-		// Sanity check to make sure the caCertBytes are actually a list of pem-encoded certificates
-		block, _ := pem.Decode(caCertBytes)
-		if block == nil || block.Type != "CERTIFICATE" {
-			log.Fatalf("Failed to find any certificates in %s", caCertFile)
-		}
-		return caCertBytes, nil
-	} else {
-		// Fetch the remote image and its manifest
-		img, err := fetchImage(caCertsImageURL)
-		if err != nil {
-			log.Fatalf("Failed to fetch image %s: %s\n", caCertsImageURL, err)
-		}
-		return extractCACerts(img)
+		return os.ReadFile(caCertFile)
 	}
+	return extractCACerts(caCertsImageURL)
 }
 
-// Extract the ca-certificates file from the remote image
-func extractCACerts(img v1.Image) ([]byte, error) {
+func extractCACerts(imageURL string) ([]byte, error) {
+	img, err := fetchImage(imageURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch image %s: %w", imageURL, err)
+	}
+
 	flattened := mutate.Extract(img)
 	tr := tar.NewReader(flattened)
 	defer flattened.Close()
-	// Read the files in the tar reader
+
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
 			break
 		}
+		if err != nil {
+			return nil, fmt.Errorf("error reading tar: %w", err)
+		}
+
 		if hdr.Name == imageCertPath || hdr.Name == strings.TrimPrefix(imageCertPath, "/") {
-			return io.ReadAll(tr)
+			certBytes, err := io.ReadAll(tr)
+			if err != nil {
+				return nil, fmt.Errorf("error reading cert file %s: %w", hdr.Name, err)
+			}
+			return certBytes, nil
 		}
 	}
 	return nil, fmt.Errorf("failed to find %s in remote image", imageCertPath)
@@ -157,32 +134,26 @@ func extractCACerts(img v1.Image) ([]byte, error) {
 
 func newImage(old v1.Image, caCertBytes []byte) (v1.Image, error) {
 	var newCaCertBytes []byte
+	// var err error
 	if replaceCerts {
 		newCaCertBytes = caCertBytes
 	} else {
-		imgCaCertBytes, err := extractCACerts(old)
+		imgCaCertBytes, err := extractCACerts(imageURL)
 		if err != nil {
-			log.Fatalf("Failed to extract CA certificates from image: %s\n", err)
+			return nil, fmt.Errorf("failed to extract CA certificates from image: %w", err)
 		}
 		newCaCertBytes = append(imgCaCertBytes, caCertBytes...)
 	}
 
-	// Create a new tar file with the modified ca-certificates file
 	buf := bytes.Buffer{}
-	newTar := tar.NewWriter(&buf)
-	newTar.WriteHeader(&tar.Header{
-		Name: imageCertPath,
-		Mode: 0644,
-		Size: int64(len(newCaCertBytes)),
-	})
-	if _, err := newTar.Write(newCaCertBytes); err != nil {
-		return nil, err
+	tarW := tar.NewWriter(&buf)
+	if err := tarW.WriteHeader(&tar.Header{Name: imageCertPath, Mode: 0644, Size: int64(len(newCaCertBytes))}); err != nil {
+		return nil, fmt.Errorf("failed to write tar header: %w", err)
 	}
-	newTar.Close()
+	if _, err := tarW.Write(newCaCertBytes); err != nil {
+		return nil, fmt.Errorf("failed to write tar body: %w", err)
+	}
+	tarW.Close()
 
-	newImg, err := mutate.Append(old, mutate.Addendum{Layer: stream.NewLayer(io.NopCloser(&buf))})
-	if err != nil {
-		return nil, fmt.Errorf("failed to append modified CA certificates to image: %s", err)
-	}
-	return newImg, nil
+	return mutate.Append(old, mutate.Addendum{Layer: stream.NewLayer(io.NopCloser(&buf))})
 }
