@@ -1,4 +1,4 @@
-module github.com/dlorenc/incert
+module github.com/wasimahmad/incert
 
 go 1.21
 
